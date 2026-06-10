@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# System
+.DS_Store
+.vscode/
+.idea/
+
+# Data
+Data/*
+!Data/README.md
+
+# Runtime outputs
+checkpoints/
+logs/
+evaluation_results/
+
+# Model checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Large data files
+*.npy
+*.npz
+*.pkl
+*.csv
+*.h5
+*.hdf5
