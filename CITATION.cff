@@ -30,6 +30,5 @@ keywords:
   - controllable generation
   - diffusion models
   - semantic alignment
-  - reinforcement alignment
 
 repository-code: "https://github.com/SemAlign-TS/SemAlign-TS"
