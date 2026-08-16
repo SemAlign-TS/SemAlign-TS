@@ -1,236 +1,169 @@
 # SemAlign-TS
 
-Official implementation for **SemAlign-TS: Observable Semantic Alignment for Controllable Text-to-Time-Series Generation**.
+Official implementation of **SemAlign-TS: Observable Semantic Alignment for Controllable Text-to-Time-Series Generation**.
 
-SemAlign-TS is a diffusion-based framework for controllable text-to-time-series generation. It separates **textual conditioning** from **observable semantic alignment**: natural-language prompts provide the input interface, while generated sequences are aligned using measurable temporal attributes such as trend direction, volatility level, and peak timing.
+SemAlign-TS formulates controllable text-to-time-series generation as a closed-loop process:
 
-<p align="center">
-  <img src="assets/framework.png" width="95%">
-</p>
+**PLAN → GENERATE → VERIFY → ALIGN**
 
-<p align="center">
-  <em>Overview of the SemAlign-TS framework.</em>
-</p>
+- **PLAN** specifies observable temporal intent, including trend, volatility, and peak location, together with paired context.
+- **GENERATE** produces candidate trajectories with a text-conditioned diffusion model.
+- **VERIFY** measures candidate-level semantic compliance and paired-reference fidelity directly in output space.
+- **ALIGN** applies Observable Semantic Relative Alignment (OSRA), using group-relative feedback and frozen-reference regularization to update the denoiser.
 
-## Overview
+The verification/alignment loop is used during training only. Inference uses a single aligned conditional generation (`G=1`) without verifier-based reranking.
 
-Existing text-to-series generators usually inject prompt information through text embeddings or cross-attention. However, conditioning on a text prompt does not guarantee that the generated time series satisfies the requested observable semantics.
+## Framework
 
-SemAlign-TS addresses this gap through three stages:
+![SemAlign-TS framework](assets/Figure_2.png)
 
-1. **Attribute-grounded prompt construction**
-   Time-series windows are converted into natural-language descriptions using observable meta-features such as trend, volatility, and peak location.
+## Main results
 
-2. **Text-conditioned temporal diffusion pretraining**
-   A compact conditional diffusion denoiser is pretrained using text embeddings as the conditioning interface.
+Under the raw-observation-disjoint evaluation protocol across six datasets, SemAlign-TS obtains the following macro results:
 
-3. **Observable Semantic Relative Alignment (OSRA)**
-   Multiple candidates generated under the same prompt are compared using decomposed semantic rewards. The model is then aligned toward candidates that better satisfy observable temporal semantics.
+| Metric | Result |
+|---|---:|
+| Trend Accuracy | 93.94% |
+| Volatility Accuracy | 98.41% |
+| Peak Accuracy | 94.46% |
+| Joint-3 Accuracy | **87.79%** |
+| MSE | 0.2709 |
+| MAE | 0.4061 |
+| DTW | **0.0912** |
 
-<p align="center">
-  <img src="assets/qualitative.png" width="95%">
-</p>
+The strongest external baseline reaches approximately **56.06% Joint-3**. A diagnostic direct LLaMA-3.1-8B-Instruct numerical-generation baseline reaches approximately **4.72% Joint-3**, indicating that general-purpose language modeling alone is insufficient for direct fine-grained controllable numerical time-series generation in this benchmark.
 
-<p align="center">
-  <em>Qualitative examples comparing the pretrained diffusion baseline and SemAlign-TS.</em>
-</p>
+## Data
 
-## Project Structure
+Processed main-experiment data are publicly available at:
+
+https://drive.google.com/drive/folders/1OcRrBivZ-EXpqR6BMG163IlBjfokDJB2?usp=sharing
+
+The release covers:
+
+- Electricity
+- ETTh1
+- ETTm1
+- Exchange Rate
+- Traffic
+- Weather
+
+Official settings use sequence length 96, stride 1, and seeds `{42, 2026, 3407}`.
+The raw timeline is partitioned before assigning windows to train/validation/test, and windows crossing split boundaries are excluded. Thus the official splits share no raw observations.
+
+See [`Data/README.md`](Data/README.md) for archive contents.
+
+## Installation
+
+```bash
+conda create -n semalign-ts python=3.10 -y
+conda activate semalign-ts
+pip install -r requirements.txt
+```
+
+Extract the six public data archives into `data/processed/` before training or evaluation.
+
+## Diffusion pre-training
+
+```bash
+python train_diffusion.py \
+  --dataset electricity \
+  --data_dir data/processed \
+  --save_dir outputs/checkpoints/seed42/pretrain \
+  --seed 42
+```
+
+## OSRA alignment
+
+```bash
+python train_osra.py \
+  --dataset electricity \
+  --data_dir data/processed \
+  --pretrain_dir outputs/checkpoints/seed42/pretrain \
+  --save_dir outputs/checkpoints/seed42 \
+  --experiment_name osra \
+  --group_size 8 \
+  --seed 42
+```
+
+## DPO mechanism control
+
+First construct preference pairs:
+
+```bash
+python prepare_dpo_pairs.py \
+  --dataset electricity \
+  --data_dir data/processed \
+  --pretrain_dir outputs/checkpoints/seed42/pretrain \
+  --output_dir outputs/dpo_pairs/seed42/electricity \
+  --seed 42
+```
+
+Then train DPO:
+
+```bash
+python train_dpo.py \
+  --dataset electricity \
+  --data_dir data/processed \
+  --pretrain_dir outputs/checkpoints/seed42/pretrain \
+  --pair_dir outputs/dpo_pairs/seed42/electricity \
+  --save_dir outputs/checkpoints/seed42/dpo \
+  --seed 42
+```
+
+## Evaluation
+
+```bash
+python evaluate.py \
+  --dataset electricity \
+  --mode osra \
+  --experiment_name osra \
+  --protocol raw_disjoint \
+  --data_dir data/processed \
+  --seed 42 \
+  --ckpt_dir outputs/checkpoints/seed42/osra/electricity \
+  --result_root outputs/evaluation_9metrics \
+  --ddim_steps 50
+```
+
+The paper-facing evaluation uses nine metrics:
+
+- semantic alignment: Trend Accuracy, Volatility Accuracy, Peak Accuracy, Joint-3 Accuracy;
+- paired trajectory fidelity: MSE, MAE, DTW;
+- population-level fidelity: MDD, ACD.
+
+## Repository structure
 
 ```text
 SemAlign-TS/
 ├── README.md
-├── requirements.txt
 ├── LICENSE
-├── diff_train.py                  # Step 1: diffusion pretraining
-├── osra_train.py                  # Step 2: OSRA fine-tuning
-├── evaluate.py                    # Step 3: evaluation
-├── diffusion_core/                # Diffusion model and scheduler
-├── reward_core/                   # Observable semantic reward functions
-├── scripts/                       # Reproduction scripts
-├── Data/                          # Preprocessed datasets, not tracked by Git
-│   └── README.md
-├── assets/                        # Figures used in this README
-│   ├── framework.png
-│   └── qualitative.png
-├── checkpoints/                   # Created at runtime
-├── logs/                          # Created at runtime
-└── evaluation_results/            # Created at runtime
+├── requirements.txt
+├── train_diffusion.py
+├── train_osra.py
+├── prepare_dpo_pairs.py
+├── train_dpo.py
+├── evaluate.py
+├── diffusion_core/
+├── reward_core/
+├── Data/
+└── assets/
 ```
 
-## Requirements
-
-We recommend Python 3.10+ and a CUDA-capable GPU.
-
-Install dependencies with:
-
-```bash
-pip install -r requirements.txt
-```
-
-If PyTorch is not installed, install the version matching your CUDA environment first. For example:
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu124
-```
-
-## Data Preparation
-
-The preprocessed datasets are not included in this repository because the files are large.
-
-Please download the preprocessed archives from the following Google Drive folder:
-
-```text
-https://drive.google.com/drive/folders/1WMdnKq43XDmWsmpZUvas3CFbu-QhZtyC?usp=sharing
-```
-
-The folder contains separate archives for the six datasets:
-
-```text
-electricity.tar.gz
-etth1.tar.gz
-ettm1.tar.gz
-exchange_rate.tar.gz
-traffic.tar.gz
-weather.tar.gz
-SHA256SUMS.txt
-```
-
-Place the downloaded `.tar.gz` files under the project root and extract them:
-
-```bash
-tar -xzf etth1.tar.gz
-tar -xzf ettm1.tar.gz
-tar -xzf electricity.tar.gz
-tar -xzf exchange_rate.tar.gz
-tar -xzf traffic.tar.gz
-tar -xzf weather.tar.gz
-```
-
-After extraction, the expected directory structure is:
-
-```text
-SemAlign-TS/
-└── Data/
-    ├── etth1/
-    │   ├── etth1_X.npy
-    │   ├── etth1_emb.npy
-    │   ├── etth1_emb_mask.npy
-    │   ├── etth1_meta.pkl
-    │   └── etth1_train_indices.npy
-    ├── ettm1/
-    ├── electricity/
-    ├── exchange_rate/
-    ├── traffic/
-    └── weather/
-```
-
-Text embeddings are stored in `float16` to reduce artifact size and are cast to `float32` during loading.
-
-To verify downloaded files, run:
-
-```bash
-sha256sum -c SHA256SUMS.txt
-```
-
-## Reproduction Pipeline
-
-Run the following commands from the project root.
-
-### Step 1: Diffusion Pretraining
-
-```bash
-python diff_train.py --dataset etth1
-```
-
-The pretrained diffusion checkpoint is saved to:
-
-```text
-checkpoints/diff_train/etth1/best_model.pt
-```
-
-### Step 2: OSRA Fine-Tuning
-
-```bash
-python osra_train.py --dataset etth1
-```
-
-The OSRA-aligned checkpoint is saved to:
-
-```text
-checkpoints/osra/main/etth1/best_model.pt
-```
-
-### Step 3: Evaluation
-
-Evaluate the pretrained diffusion baseline:
-
-```bash
-python evaluate.py --dataset etth1 --mode diff_train
-```
-
-Evaluate SemAlign-TS after OSRA fine-tuning:
-
-```bash
-python evaluate.py --dataset etth1 --mode osra
-```
-
-Evaluation results are written to:
-
-```text
-evaluation_results/diff_train/
-evaluation_results/osra/
-```
-
-## Running All Datasets
-
-To run all datasets, use the scripts under `scripts/`:
-
-```bash
-bash scripts/train_all.sh
-bash scripts/eval_all.sh
-```
-
-The supported dataset names are:
-
-```text
-etth1
-ettm1
-electricity
-exchange_rate
-traffic
-weather
-```
-
-## Evaluation Metrics
-
-We report two groups of metrics.
-
-| Category                  | Metrics                                                                       |
-| ------------------------- | ----------------------------------------------------------------------------- |
-| Fidelity and distribution | MSE, MAE, DTW, KLD                                                            |
-| Semantic controllability  | Trend Accuracy, Volatility Accuracy, Peak Accuracy, Average Semantic Accuracy |
-
-Semantic metrics are computed from observable attributes extracted from generated sequences and compared with the requested prompt-level labels.
-
-## Notes
-
-* `Data/`, `checkpoints/`, `logs/`, and `evaluation_results/` are excluded from Git tracking.
-* The repository contains code and instructions for reproducing the main pipeline.
-* Large preprocessed data archives are provided separately through Google Drive.
-* OSRA stands for **Observable Semantic Relative Alignment**.
+This public repository intentionally keeps only the core implementation needed to understand and run SemAlign-TS. Large datasets, checkpoints, experiment outputs, paper-result snapshots, auxiliary launchers, and plotting utilities are distributed separately or omitted.
 
 ## Citation
 
 ```bibtex
-@inproceedings{semalign-ts,
-  title     = {SemAlign-TS: Observable Semantic Alignment for Controllable Text-to-Time-Series Generation},
-  author    = {Hongbang Ji and Yitao Jia and Leilei Sun and Liangzhe Han and Tongyu Zhu},
-  booktitle = {Proceedings of the IEEE International Conference on Data Engineering},
-  year      = {2026}
+@article{ji2026semalign,
+  title   = {SemAlign-TS: Observable Semantic Alignment for Controllable Text-to-Time-Series Generation},
+  author  = {Ji, Hongbang and Tao, Jiayi and Sun, Leilei and Han, Liangzhe and Zhu, Tongyu},
+  journal = {Information Sciences},
+  year    = {2026},
+  note    = {Under review}
 }
 ```
 
 ## License
 
-This repository is released for research and reproducibility purposes.
+This release is intended to retain the existing `LICENSE` file from the GitHub repository.

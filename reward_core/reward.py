@@ -1,3 +1,7 @@
+"""
+Reward v2 - 语义 + 温度化MSE + 平滑压缩
+get_raw_reward: 返回平滑压缩后、未做 relative_normalize 的奖励，供 GRPO 组内归一化使用
+"""
 import torch
 import torch.nn.functional as F
 
@@ -57,7 +61,7 @@ class TimeSeriesReward:
         if reward_config:
             self.config.update(reward_config)
 
-        print(f"[Reward] {dataset_name}: semantic + temperature-scaled MSE + smooth compression")
+        print(f"[Reward] {dataset_name}: 奖励配置（语义 + 温度化MSE + 平滑压缩）")
 
     def extract_features_from_series(self, series):
         batch_size, seq_len, _ = series.shape
@@ -191,6 +195,7 @@ class TimeSeriesReward:
         return raw_total, info
 
     def get_raw_reward(self, series, target_meta=None, target_series=None):
+        """返回平滑压缩后、未做 relative_normalize 的奖励，供 GRPO 组内归一化使用"""
         raw_total, info = self._compute_raw(series, target_meta, target_series)
         compressed = self.smooth_compress(raw_total)
         info["raw_total"] = raw_total

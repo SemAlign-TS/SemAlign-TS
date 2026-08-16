@@ -61,12 +61,6 @@ def get_lr_schedule(epoch, warmup_epochs=10, total_epochs=40):
     return 0.5 * (1 + np.cos(np.pi * progress))
 
 
-def group_zscore(values, eps=1e-6):
-    mean = values.mean(dim=0, keepdim=True)
-    std = values.std(dim=0, unbiased=False, keepdim=True)
-    return (values - mean) / (std + eps)
-
-
 def grpo_advantage(rewards, eps=1e-6, clip_value=2.5):
     mean_r = rewards.mean(dim=0, keepdim=True)
     std_r = rewards.std(dim=0, unbiased=False, keepdim=True)
@@ -77,7 +71,6 @@ def grpo_advantage(rewards, eps=1e-6, clip_value=2.5):
 def combine_component_rewards(
     component_stacks,
     reward_mode="full",
-    component_norm=True,
 ):
     active_components = get_active_reward_components(reward_mode)
 
@@ -88,13 +81,8 @@ def combine_component_rewards(
     for name in active_components:
         raw_component = component_stacks[name]
 
-        if component_norm:
-            component_for_grpo = group_zscore(raw_component)
-        else:
-            component_for_grpo = raw_component
-
         weight = 1.0
-        total = total + weight * component_for_grpo
+        total = total + weight * raw_component
 
         component_debug[f"{name}_raw_mean"] = float(raw_component.mean().item())
         component_debug[f"{name}_raw_std"] = float(
@@ -190,16 +178,86 @@ def calculate_alignment_metrics(series, target_meta, target_series, mse_temperat
     }
 
 
+@torch.no_grad()
+def evaluate_validation(
+    diffusion,
+    val_loader,
+    val_meta,
+    validation_seed,
+    ddim_steps,
+    mse_temperature,
+    selection_mse_weight,
+):
+    """Evaluate one deterministic DDIM sample per validation condition."""
+    generator = torch.Generator(device=device)
+    generator.manual_seed(int(validation_seed))
+
+    totals = {
+        "trend_acc": 0.0,
+        "trend_soft_score": 0.0,
+        "volatility_acc": 0.0,
+        "peak_acc": 0.0,
+        "mse_score": 0.0,
+    }
+    total_n = 0
+
+    for batch_x, batch_emb, batch_mask, batch_idx in val_loader:
+        batch_x = batch_x.to(device, non_blocking=True)
+        batch_emb = batch_emb.to(device, non_blocking=True)
+        batch_mask = batch_mask.to(device, non_blocking=True)
+        batch_meta = [val_meta[int(i)] for i in batch_idx.tolist()]
+        batch_size = int(batch_x.shape[0])
+
+        init_noise = torch.randn(
+            (batch_size, 96, 1),
+            generator=generator,
+            device=device,
+        )
+        generated = diffusion.ddim_sample(
+            batch_emb,
+            batch_mask,
+            shape=(batch_size, 96, 1),
+            ddim_steps=ddim_steps,
+            eta=0.0,
+            init_noise=init_noise,
+        )
+        metrics = calculate_alignment_metrics(
+            generated,
+            batch_meta,
+            batch_x,
+            mse_temperature,
+        )
+        for key in totals:
+            totals[key] += float(metrics[key]) * batch_size
+        total_n += batch_size
+
+    if total_n <= 0:
+        raise RuntimeError("Validation split is empty")
+
+    result = {key: value / total_n for key, value in totals.items()}
+    result["semantic_score"] = (
+        result["trend_acc"]
+        + result["volatility_acc"]
+        + result["peak_acc"]
+    ) / 3.0
+    result["select_score"] = (
+        result["semantic_score"]
+        + float(selection_mse_weight) * result["mse_score"]
+    )
+    result["num_samples"] = total_n
+    return result
+
+
 def assert_finite_tensor(name, tensor):
     if not torch.isfinite(tensor).all():
         raise FloatingPointError(f"Non-finite tensor detected: {name}")
 
 
-def train_grpo(args):
+def train_osra(args):
     set_seed(args.seed)
 
     if args.group_size < 2:
-        raise ValueError("GRPO requires --group_size >= 2.")
+        raise ValueError("OSRA requires --group_size >= 2.")
 
     dataset = args.dataset.lower()
     experiment_name = args.experiment_name
@@ -216,13 +274,13 @@ def train_grpo(args):
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
-    diff_train_dir = os.path.join(args.diff_train_dir, dataset)
-    diff_train_path = os.path.join(diff_train_dir, "best_model.pt")
+    pretrain_dir = os.path.join(args.pretrain_dir, dataset)
+    pretrain_path = os.path.join(pretrain_dir, "best_model.pt")
 
-    if not os.path.isfile(diff_train_path):
+    if not os.path.isfile(pretrain_path):
         raise FileNotFoundError(
-            f"Diffusion checkpoint not found: {diff_train_path}. "
-            f"Please check --diff_train_dir or run diff_train.py first."
+            f"Pretrained checkpoint not found: {pretrain_path}. "
+            f"Please check --pretrain_dir or run pretraining first."
         )
 
     t_low_ratio = max(0.0, min(1.0, args.t_low_ratio))
@@ -234,7 +292,7 @@ def train_grpo(args):
     def ts():
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    print(f"[{ts()}] OSRA Training Start", flush=True)
+    print(f"[{ts()}] OSRA Post-training Start", flush=True)
     print(
         f"[{ts()}] exp={experiment_name} dataset={dataset} "
         f"epochs={args.epochs} batch={args.batch_size} "
@@ -242,8 +300,7 @@ def train_grpo(args):
         f"kl_coef={args.kl_coef} lr={args.lr} "
         f"warmup={args.warmup_epochs} "
         f"t_range=[{t_low_ratio:.2f},{t_high_ratio:.2f}] "
-        f"reward_mode={args.reward_mode} "
-        f"component_norm={not args.disable_component_reward_norm} seed={args.seed}",
+        f"reward_mode={args.reward_mode} seed={args.seed}",
         flush=True,
     )
     print(f"[{ts()}] Save dir: {save_dir}", flush=True)
@@ -262,13 +319,29 @@ def train_grpo(args):
     train_indices = np.load(
         os.path.join(args.data_dir, dataset, f"{dataset}_train_indices.npy")
     )
+    val_indices = np.load(
+        os.path.join(args.data_dir, dataset, f"{dataset}_val_indices.npy")
+    )
 
     train_x = torch.from_numpy(all_x[train_indices]).float()
     train_emb = torch.from_numpy(all_emb[train_indices]).float()
     train_mask = torch.from_numpy(all_emb_mask[train_indices]).bool()
     train_meta = [all_meta[i] for i in train_indices]
 
-    print(f"[{ts()}] Train samples: {len(train_x)}", flush=True)
+    if args.val_max_samples > 0 and len(val_indices) > args.val_max_samples:
+        rng = np.random.RandomState(args.validation_seed)
+        val_indices = np.sort(
+            rng.choice(val_indices, size=args.val_max_samples, replace=False)
+        )
+    val_x = torch.from_numpy(all_x[val_indices]).float()
+    val_emb = torch.from_numpy(all_emb[val_indices]).float()
+    val_mask = torch.from_numpy(all_emb_mask[val_indices]).bool()
+    val_meta = [all_meta[i] for i in val_indices]
+
+    print(
+        f"[{ts()}] Train samples: {len(train_x)} | Validation samples: {len(val_x)}",
+        flush=True,
+    )
 
     dataloader = DataLoader(
         TensorDataset(train_x, train_emb, train_mask, torch.arange(len(train_x))),
@@ -277,6 +350,14 @@ def train_grpo(args):
         num_workers=0,
         pin_memory=False,
         drop_last=True,
+    )
+    val_loader = DataLoader(
+        TensorDataset(val_x, val_emb, val_mask, torch.arange(len(val_x))),
+        batch_size=args.val_batch_size,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=False,
+        drop_last=False,
     )
 
     model = TimeSeriesDiffuserV2(
@@ -287,10 +368,10 @@ def train_grpo(args):
         nhead=8,
     ).to(device)
 
-    state_dict = torch.load(diff_train_path, map_location=device)
+    state_dict = torch.load(pretrain_path, map_location=device)
     model.load_state_dict(state_dict)
 
-    print(f"[{ts()}] Loaded diffusion policy: {diff_train_path}", flush=True)
+    print(f"[{ts()}] Loaded pretrain policy: {pretrain_path}", flush=True)
 
     ref_model = TimeSeriesDiffuserV2(
         seq_len=96,
@@ -329,11 +410,10 @@ def train_grpo(args):
     G = args.group_size
     best_select_score = -float("inf")
     best_epoch = -1
+    validation_checks_without_improvement = 0
 
     clip_eps = args.clip_eps
     grad_clip = args.grad_clip
-    component_norm = not args.disable_component_reward_norm
-
     for epoch in range(args.epochs):
         phase_name = "StaticSemanticWeights"
         cur_weights = {
@@ -399,7 +479,7 @@ def train_grpo(args):
 
         ep_component_debug = []
 
-        for batch_x, batch_emb, batch_mask, batch_idx in dataloader:
+        for batch_no, (batch_x, batch_emb, batch_mask, batch_idx) in enumerate(dataloader, start=1):
             batch_x = batch_x.to(device)
             batch_emb = batch_emb.to(device)
             batch_mask = batch_mask.to(device)
@@ -458,7 +538,6 @@ def train_grpo(args):
                 rewards_tensor, component_debug = combine_component_rewards(
                     component_stacks,
                     reward_mode=args.reward_mode,
-                    component_norm=component_norm,
                 )
 
                 assert_finite_tensor("rewards_tensor", rewards_tensor)
@@ -580,6 +659,24 @@ def train_grpo(args):
             ep_pg_loss.append(pg_loss_total.item())
             ep_kl.append(kl_loss_total.item())
 
+            if (
+                args.log_interval_batches > 0
+                and (
+                    batch_no == 1
+                    or batch_no % args.log_interval_batches == 0
+                    or batch_no == len(dataloader)
+                )
+            ):
+                print(
+                    f"[{ts()}] Epoch {epoch + 1}/{args.epochs} "
+                    f"batch {batch_no}/{len(dataloader)} | "
+                    f"Loss:{float(np.mean(ep_loss)):.4f} "
+                    f"PG:{float(np.mean(ep_pg_loss)):.4f} "
+                    f"KL:{float(np.mean(ep_kl)):.4f} "
+                    f"R:{float(np.mean(ep_r_mean)):.3f}",
+                    flush=True,
+                )
+
         al = float(np.mean(ep_loss))
         apg = float(np.mean(ep_pg_loss))
         akl = float(np.mean(ep_kl))
@@ -601,7 +698,20 @@ def train_grpo(args):
         mse_score = float(np.mean(ep_mse_score)) if ep_mse_score else 0.0
 
         semantic_score = (trend_acc + vol_acc + peak_acc) / 3.0
-        select_score = semantic_score + args.selection_mse_weight * mse_score
+        train_select_score = semantic_score + args.selection_mse_weight * mse_score
+
+        run_validation = (epoch == 0) or ((epoch + 1) % args.val_interval == 0)
+        val_metrics = None
+        if run_validation:
+            val_metrics = evaluate_validation(
+                diffusion=diffusion,
+                val_loader=val_loader,
+                val_meta=val_meta,
+                validation_seed=args.validation_seed,
+                ddim_steps=args.val_ddim_steps,
+                mse_temperature=args.mse_temperature,
+                selection_mse_weight=args.selection_mse_weight,
+            )
 
         lr_now = float(optimizer.param_groups[0]["lr"])
         cur_ts = ts()
@@ -621,7 +731,6 @@ def train_grpo(args):
             "epoch": epoch + 1,
             "phase": phase_name,
             "reward_mode": args.reward_mode,
-            "component_reward_norm": component_norm,
             "seed": args.seed,
             "loss": al,
             "pg_loss": apg,
@@ -640,7 +749,8 @@ def train_grpo(args):
             "peak_acc": peak_acc,
             "mse_score": mse_score,
             "semantic_score": semantic_score,
-            "select_score": select_score,
+            "train_select_score": train_select_score,
+            "validation": val_metrics,
             "weight_trend": float(cur_weights["weight_trend"]),
             "weight_volatility": float(cur_weights["weight_volatility"]),
             "weight_peak": float(cur_weights["weight_peak"]),
@@ -662,7 +772,7 @@ def train_grpo(args):
             f"Semantic:{semantic_score:.3f} "
             f"TrendSoft:{trend_soft:.3f} "
             f"MSEScore:{mse_score:.3f} "
-            f"Select:{select_score:.3f} | "
+            f"TrainSelect:{train_select_score:.3f} | "
             f"W(T/V/P/M):{cur_weights['weight_trend']:.2f}/"
             f"{cur_weights['weight_volatility']:.2f}/"
             f"{cur_weights['weight_peak']:.2f}/"
@@ -671,50 +781,91 @@ def train_grpo(args):
             flush=True,
         )
 
-        if select_score > best_select_score:
-            best_select_score = select_score
-            best_epoch = epoch + 1
-
-            best_path = os.path.join(save_dir, "best_model.pt")
-            torch.save(model.state_dict(), best_path)
-
-            best_info_path = os.path.join(save_dir, "best_model_info.json")
-            with open(best_info_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "best_epoch": best_epoch,
-                        "best_select_score": float(best_select_score),
-                        "semantic_score": float(semantic_score),
-                        "trend_acc": float(trend_acc),
-                        "vol_acc": float(vol_acc),
-                        "peak_acc": float(peak_acc),
-                        "mse_score": float(mse_score),
-                        "weights": {
-                            "weight_trend": float(cur_weights["weight_trend"]),
-                            "weight_volatility": float(
-                                cur_weights["weight_volatility"]
-                            ),
-                            "weight_peak": float(cur_weights["weight_peak"]),
-                            "weight_mse": float(cur_weights["weight_mse"]),
-                        },
-                    },
-                    f,
-                    indent=2,
-                    ensure_ascii=False,
-                )
-
+        if val_metrics is not None:
             print(
-                f"[{cur_ts}] New best model saved -> {best_path} | "
-                f"Select:{best_select_score:.4f} "
-                f"Semantic:{semantic_score:.4f} "
-                f"MSEScore:{mse_score:.4f}",
+                f"[{cur_ts}] Validation | n={val_metrics['num_samples']} | "
+                f"Acc T/V/P:{val_metrics['trend_acc']:.3f}/"
+                f"{val_metrics['volatility_acc']:.3f}/"
+                f"{val_metrics['peak_acc']:.3f} | "
+                f"Semantic:{val_metrics['semantic_score']:.3f} | "
+                f"MSEScore:{val_metrics['mse_score']:.3f} | "
+                f"Select:{val_metrics['select_score']:.3f}",
                 flush=True,
             )
+
+            improvement_threshold = (
+                best_select_score + float(args.early_stop_min_delta)
+            )
+            if val_metrics["select_score"] > improvement_threshold:
+                best_select_score = float(val_metrics["select_score"])
+                best_epoch = epoch + 1
+                validation_checks_without_improvement = 0
+
+                best_path = os.path.join(save_dir, "best_model.pt")
+                torch.save(model.state_dict(), best_path)
+
+                best_info_path = os.path.join(save_dir, "best_model_info.json")
+                with open(best_info_path, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "selection_source": "validation",
+                            "best_epoch": best_epoch,
+                            "best_select_score": best_select_score,
+                            "validation": val_metrics,
+                            "train_metrics_at_best_epoch": {
+                                "semantic_score": semantic_score,
+                                "mse_score": mse_score,
+                                "train_select_score": train_select_score,
+                            },
+                            "early_stopping": {
+                                "min_delta": float(args.early_stop_min_delta),
+                                "patience_validation_checks": int(
+                                    args.early_stop_patience
+                                ),
+                                "min_epochs": int(args.min_epochs),
+                            },
+                        },
+                        f,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+
+                print(
+                    f"[{cur_ts}] New validation-best model -> {best_path} | "
+                    f"Select:{best_select_score:.4f} "
+                    f"Semantic:{val_metrics['semantic_score']:.4f} "
+                    f"MSEScore:{val_metrics['mse_score']:.4f}",
+                    flush=True,
+                )
+            else:
+                validation_checks_without_improvement += 1
+                print(
+                    f"[{cur_ts}] No validation improvement | "
+                    f"checks={validation_checks_without_improvement}/"
+                    f"{args.early_stop_patience} | "
+                    f"best={best_select_score:.4f}",
+                    flush=True,
+                )
 
         if (epoch + 1) % args.save_interval == 0:
             ckpt_path = os.path.join(save_dir, f"ckpt_epoch{epoch + 1}.pt")
             torch.save(model.state_dict(), ckpt_path)
             print(f"[{cur_ts}] Checkpoint -> {ckpt_path}", flush=True)
+
+        if (
+            args.early_stop_patience > 0
+            and (epoch + 1) >= args.min_epochs
+            and validation_checks_without_improvement
+            >= args.early_stop_patience
+        ):
+            print(
+                f"[{ts()}] Early stopping at epoch {epoch + 1}: "
+                f"no validation improvement larger than "
+                f"{args.early_stop_min_delta:g} for "
+                f"{validation_checks_without_improvement} validation checks.",
+                flush=True,
+            )
+            break
 
     final_path = os.path.join(save_dir, "final_model.pt")
     torch.save(model.state_dict(), final_path)
@@ -731,11 +882,11 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--dataset", type=str, required=True)
-    parser.add_argument("--experiment_name", type=str, default="main")
-    parser.add_argument("--save_dir", type=str, default="checkpoints/osra")
-    parser.add_argument("--log_dir", type=str, default="logs/osra")
-    parser.add_argument("--data_dir", type=str, default="Data")
-    parser.add_argument("--diff_train_dir", type=str, default="checkpoints/diff_train")
+    parser.add_argument("--experiment_name", type=str, default="osra")
+    parser.add_argument("--save_dir", type=str, default="outputs/checkpoints")
+    parser.add_argument("--log_dir", type=str, default="outputs/logs/osra")
+    parser.add_argument("--data_dir", type=str, default="data/processed")
+    parser.add_argument("--pretrain_dir", type=str, default="outputs/checkpoints/pretrain")
 
     parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch_size", type=int, default=128)
@@ -764,8 +915,35 @@ def parse_args():
     )
 
     parser.add_argument("--selection_mse_weight", type=float, default=0.2)
-
-    parser.add_argument("--disable_component_reward_norm", action="store_true")
+    parser.add_argument("--val_interval", type=int, default=1)
+    parser.add_argument("--val_batch_size", type=int, default=128)
+    parser.add_argument("--val_ddim_steps", type=int, default=20)
+    parser.add_argument("--val_max_samples", type=int, default=0)
+    parser.add_argument("--validation_seed", type=int, default=91021)
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=0,
+        help="Stop after this many validation checks without improvement; 0 disables.",
+    )
+    parser.add_argument(
+        "--early_stop_min_delta",
+        type=float,
+        default=0.0,
+        help="Minimum validation Select improvement required to reset patience.",
+    )
+    parser.add_argument(
+        "--min_epochs",
+        type=int,
+        default=1,
+        help="Minimum number of epochs before early stopping is allowed.",
+    )
+    parser.add_argument(
+        "--log_interval_batches",
+        type=int,
+        default=50,
+        help="Print live batch progress every N batches; 0 disables.",
+    )
 
     parser.add_argument("--hit_score", type=float, default=10.0)
     parser.add_argument("--mse_temperature", type=float, default=0.5)
@@ -777,4 +955,4 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    train_grpo(args)
+    train_osra(args)
