@@ -164,6 +164,26 @@ This public repository intentionally keeps only the core implementation needed t
 }
 ```
 
+## Data and Code Availability
+
+### Source code
+
+The source code is publicly available at:
+
+https://github.com/SemAlign-TS/SemAlign-TS
+
+The version accompanying the manuscript is permanently archived on Zenodo:
+
+**Code DOI:** https://doi.org/10.5281/zenodo.21963470
+
+### Processed experimental data
+
+The processed main-experiment data are publicly available at:
+
+https://drive.google.com/drive/folders/1OcRrBivZ-EXpqR6BMG163IlBjfokDJB2?usp=sharing
+
+A persistent Zenodo dataset DOI will be added after the dataset archive is published.
+
 ## License
 
 This release is intended to retain the existing `LICENSE` file from the GitHub repository.
