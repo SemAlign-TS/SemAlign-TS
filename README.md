@@ -157,7 +157,7 @@ This public repository intentionally keeps only the core implementation needed t
 ```bibtex
 @article{ji2026semalign,
   title   = {SemAlign-TS: Observable Semantic Alignment for Controllable Text-to-Time-Series Generation},
-  author  = {Ji, Hongbang and Tao, Jiayi and Sun, Leilei and Han, Liangzhe and Zhu, Tongyu},
+  author  = {Ji, Hongbang and Jia, Yitao and Sun, Leilei and Han, Liangzhe and Zhu, Tongyu},
   journal = {Information Sciences},
   year    = {2026},
   note    = {Under review}
