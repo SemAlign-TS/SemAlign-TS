@@ -1,34 +1,20 @@
-﻿cff-version: 1.2.0
+cff-version: 1.2.0
 message: "If you use SemAlign-TS in your research, please cite this software and the accompanying paper."
 title: "SemAlign-TS: Observable Semantic Alignment for Controllable Text-to-Time-Series Generation"
-version: 1.0.0
-type: software
 
 authors:
-  - family-names: Ji
-    given-names: Hongbang
-  - family-names: Jia
-    given-names: Yitao
-  - family-names: Sun
-    given-names: Leilei
-  - family-names: Han
-    given-names: Liangzhe
-  - family-names: Zhu
-    given-names: Tongyu
+  - family-names: "Ji"
+    given-names: "Hongbang"
+  - family-names: "Jia"
+    given-names: "Yitao"
+  - family-names: "Sun"
+    given-names: "Leilei"
+  - family-names: "Han"
+    given-names: "Liangzhe"
+  - family-names: "Zhu"
+    given-names: "Tongyu"
 
-abstract: >-
-  SemAlign-TS is a diffusion-based framework for controllable
-  text-to-time-series generation. It formulates generation as a
-  closed-loop PLAN-GENERATE-VERIFY-ALIGN process and introduces
-  Observable Semantic Relative Alignment (OSRA) to align generated
-  trajectories with observable temporal semantics including trend,
-  volatility, and peak location.
-
-keywords:
-  - time series generation
-  - text-to-time-series
-  - controllable generation
-  - diffusion models
-  - semantic alignment
-
+version: "1.0.0"
+date-released: "2026-08-16"
+doi: "10.5281/zenodo.21963470"
 repository-code: "https://github.com/SemAlign-TS/SemAlign-TS"
